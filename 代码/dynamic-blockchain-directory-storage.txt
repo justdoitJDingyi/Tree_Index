@@ -1,0 +1,668 @@
+#include <iostream>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <cstring>
+#include <ctime>
+#include <memory>
+#include <set>
+#include <chrono>
+#include <filesystem>
+
+// Block type enumeration (8KB/16KB/32KB/64KB)
+enum BlockType {
+    BLOCK_8K = 0,   // 8KB block
+    BLOCK_16K = 1,  // 16KB block
+    BLOCK_32K = 2,  // 32KB block
+    BLOCK_64K = 3   // 64KB block
+};
+
+// Configuration constants
+constexpr size_t RECORD_SIZE = 256;  // Each record is 256 bytes
+constexpr size_t TIMESTAMP_SIZE = 8; // Last 8 bytes of each record store timestamp
+
+// Block size in bytes for each block type
+constexpr size_t BLOCK_SIZES[] = {
+    8 * 1024,    // 8KB
+    16 * 1024,   // 16KB
+    32 * 1024,   // 32KB
+    64 * 1024    // 64KB
+};
+
+// Records per block for each block type
+constexpr size_t RECORDS_PER_BLOCK[] = {
+    BLOCK_SIZES[0] / RECORD_SIZE,  // Records in 8KB block
+    BLOCK_SIZES[1] / RECORD_SIZE,  // Records in 16KB block
+    BLOCK_SIZES[2] / RECORD_SIZE,  // Records in 32KB block
+    BLOCK_SIZES[3] / RECORD_SIZE   // Records in 64KB block
+};
+
+// File location metadata (second-level hash table Value type)
+struct FileLocation {
+    BlockType block_type;  // Block type
+    uint32_t chunk_id;     // Chunk ID
+    uint32_t slot;         // Slot offset within the chunk
+    
+    FileLocation() : block_type(BLOCK_8K), chunk_id(0), slot(0) {}
+    
+    FileLocation(BlockType type, uint32_t id, uint32_t offset) 
+        : block_type(type), chunk_id(id), slot(offset) {}
+};
+
+// Chunk node (linked list structure)
+struct ChunkNode {
+    uint32_t chunk_id;           // Physical chunk ID
+    BlockType block_type;        // Current block type (8K/16K/32K/64K)
+    uint32_t remaining_offset;   // Remaining offset within the block
+    ChunkNode* next;             // Pointer to the next block
+    
+    ChunkNode() : chunk_id(0), block_type(BLOCK_8K), remaining_offset(0), next(nullptr) {}
+    
+    ChunkNode(uint32_t id, BlockType type) 
+        : chunk_id(id), block_type(type), next(nullptr) {
+        // Initialize remaining offset to the total capacity of the block
+        remaining_offset = RECORDS_PER_BLOCK[type] * RECORD_SIZE;
+    }
+    
+    ~ChunkNode() {
+        // Recursively delete the chain
+        if (next) {
+            delete next;
+            next = nullptr;
+        }
+    }
+};
+
+// Directory metadata entry (first-level hash table Value type)
+struct DirEntry {
+    uint64_t dir_id;                                           // Directory ID
+    BlockType current_block_type;                              // Current block type
+    ChunkNode* chunk_chain;                                    // Head of block chain
+    std::unordered_map<std::string, FileLocation>* file_map;   // Filename -> Location map
+    
+    DirEntry() : dir_id(0), current_block_type(BLOCK_8K), chunk_chain(nullptr), file_map(nullptr) {}
+    
+    DirEntry(uint64_t id) : dir_id(id), current_block_type(BLOCK_8K), chunk_chain(nullptr) {
+        file_map = new std::unordered_map<std::string, FileLocation>();
+    }
+    
+    ~DirEntry() {
+        if (chunk_chain) {
+            delete chunk_chain;
+            chunk_chain = nullptr;
+        }
+        
+        if (file_map) {
+            delete file_map;
+            file_map = nullptr;
+        }
+    }
+};
+
+// ReadDir cursor for pagination
+struct ReadDirCursor {
+    uint64_t dir_id;         // Directory ID
+    ChunkNode* current_node; // Current chunk node
+    uint32_t current_slot;   // Current slot within the chunk
+    uint64_t global_ts;      // Global timestamp for this readdir operation
+    std::set<std::string> returned_files; // Set of already returned filenames
+    
+    ReadDirCursor() : dir_id(0), current_node(nullptr), current_slot(0), global_ts(0) {}
+    
+    ReadDirCursor(uint64_t id, ChunkNode* node, uint64_t ts) 
+        : dir_id(id), current_node(node), current_slot(0), global_ts(ts) {}
+};
+
+// Structure to store file metadata in the block
+struct FileMetadata {
+    char name[240];         // Filename (240 bytes)
+    uint64_t inode;         // Inode number (8 bytes)
+    uint64_t timestamp;     // Timestamp (8 bytes)
+    
+    FileMetadata() {
+        memset(name, 0, sizeof(name));
+        inode = 0;
+        timestamp = 0;
+    }
+    
+    FileMetadata(const std::string& filename, uint64_t inodeNum) {
+        strncpy(name, filename.c_str(), sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';  // Ensure null-termination
+        inode = inodeNum;
+        timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+};
+
+// Class to manage the free blocks
+class FreeBlockManager {
+private:
+    // Bitmap for each block type
+    std::vector<bool> free_blocks_[4];
+    size_t next_block_id_[4];
+    
+public:
+    FreeBlockManager() {
+        // Initialize with some blocks for each type
+        for (int i = 0; i < 4; i++) {
+            free_blocks_[i].resize(1000, true);  // All blocks are free initially
+            next_block_id_[i] = 0;
+        }
+    }
+    
+    // Allocate a block of the specified type
+    uint32_t allocate_block(BlockType type) {
+        for (size_t i = next_block_id_[type]; i < free_blocks_[type].size(); i++) {
+            if (free_blocks_[type][i]) {
+                free_blocks_[type][i] = false;  // Mark as used
+                next_block_id_[type] = i + 1;   // Update next search position
+                return static_cast<uint32_t>(i);
+            }
+        }
+        
+        // No free blocks found, extend the bitmap
+        size_t old_size = free_blocks_[type].size();
+        free_blocks_[type].resize(old_size + 1000, true);
+        free_blocks_[type][old_size] = false;  // Mark as used
+        next_block_id_[type] = old_size + 1;   // Update next search position
+        return static_cast<uint32_t>(old_size);
+    }
+    
+    // Free a block of the specified type
+    void free_block(BlockType type, uint32_t block_id) {
+        if (block_id < free_blocks_[type].size()) {
+            free_blocks_[type][block_id] = true;  // Mark as free
+            if (block_id < next_block_id_[type]) {
+                next_block_id_[type] = block_id;  // Update next search position
+            }
+        }
+    }
+};
+
+// The main storage engine class
+class BlockchainDirectoryStorage {
+private:
+    // First-level hash table: directory ID -> DirEntry
+    std::unordered_map<uint64_t, DirEntry*> dir_map_;
+    
+    // Free block manager
+    FreeBlockManager free_block_manager_;
+    
+    // Block pool files
+    std::fstream block_files_[4];
+    
+    // Directory for block files
+    std::string block_dir_;
+    
+    // Get the current timestamp
+    uint64_t get_current_timestamp() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    
+    // Find the tail node of a chain
+    ChunkNode* find_tail_node(ChunkNode* head) {
+        if (!head) return nullptr;
+        
+        ChunkNode* current = head;
+        while (current->next) {
+            current = current->next;
+        }
+        return current;
+    }
+    
+    // Read a record from a block
+    bool read_record(BlockType type, uint32_t chunk_id, uint32_t slot, FileMetadata& metadata) {
+        if (!block_files_[type].is_open()) return false;
+        
+        // Calculate the offset in the file
+        size_t offset = static_cast<size_t>(chunk_id) * BLOCK_SIZES[type] + static_cast<size_t>(slot) * RECORD_SIZE;
+        
+        // Seek to the position and read
+        block_files_[type].seekg(offset);
+        block_files_[type].read(reinterpret_cast<char*>(&metadata), sizeof(FileMetadata));
+        
+        return block_files_[type].good();
+    }
+    
+    // Write a record to a block
+    bool write_record(BlockType type, uint32_t chunk_id, uint32_t slot, const FileMetadata& metadata) {
+        if (!block_files_[type].is_open()) return false;
+        
+        // Calculate the offset in the file
+        size_t offset = static_cast<size_t>(chunk_id) * BLOCK_SIZES[type] + static_cast<size_t>(slot) * RECORD_SIZE;
+        
+        // Seek to the position and write
+        block_files_[type].seekp(offset);
+        block_files_[type].write(reinterpret_cast<const char*>(&metadata), sizeof(FileMetadata));
+        block_files_[type].flush();
+        
+        return block_files_[type].good();
+    }
+    
+public:
+    BlockchainDirectoryStorage(const std::string& block_directory = "block_pool") 
+        : block_dir_(block_directory) {
+        // Create the block directory if it doesn't exist
+        std::filesystem::create_directories(block_dir_);
+        
+        // Open or create the block files
+        const char* file_suffixes[] = {"8k", "16k", "32k", "64k"};
+        for (int i = 0; i < 4; i++) {
+            std::string filename = block_dir_ + "/block_" + file_suffixes[i] + ".bin";
+            block_files_[i].open(filename, std::ios::in | std::ios::out | std::ios::binary);
+            if (!block_files_[i].is_open()) {
+                // File doesn't exist, create it
+                block_files_[i].open(filename, std::ios::out | std::ios::binary);
+                block_files_[i].close();
+                block_files_[i].open(filename, std::ios::in | std::ios::out | std::ios::binary);
+            }
+        }
+    }
+    
+    ~BlockchainDirectoryStorage() {
+        // Close the block files
+        for (int i = 0; i < 4; i++) {
+            if (block_files_[i].is_open()) {
+                block_files_[i].close();
+            }
+        }
+        
+        // Clean up the dir_map_
+        for (auto& pair : dir_map_) {
+            delete pair.second;
+        }
+        dir_map_.clear();
+    }
+    
+    // Create a new directory
+    bool create_directory(uint64_t dir_id) {
+        if (dir_map_.find(dir_id) != dir_map_.end()) {
+            // Directory already exists
+            return false;
+        }
+        
+        // Create a new directory entry
+        DirEntry* dir_entry = new DirEntry(dir_id);
+        
+        // Allocate the first block
+        uint32_t chunk_id = free_block_manager_.allocate_block(BLOCK_8K);
+        dir_entry->chunk_chain = new ChunkNode(chunk_id, BLOCK_8K);
+        
+        // Add to the map
+        dir_map_[dir_id] = dir_entry;
+        
+        return true;
+    }
+    
+    // Write a file to a directory
+    bool write_file(uint64_t dir_id, const std::string& filename, uint64_t inode) {
+        auto dir_it = dir_map_.find(dir_id);
+        if (dir_it == dir_map_.end()) {
+            // Directory doesn't exist
+            return false;
+        }
+        
+        DirEntry* dir_entry = dir_it->second;
+        
+        // Check if the file already exists
+        auto file_it = dir_entry->file_map->find(filename);
+        if (file_it != dir_entry->file_map->end()) {
+            // File already exists, update it
+            FileLocation& loc = file_it->second;
+            
+            // Create the file metadata
+            FileMetadata metadata(filename, inode);
+            
+            // Write to the existing location
+            return write_record(loc.block_type, loc.chunk_id, loc.slot, metadata);
+        }
+        
+        // Find the tail node
+        ChunkNode* tail = find_tail_node(dir_entry->chunk_chain);
+        if (!tail) {
+            // This shouldn't happen, but just in case
+            uint32_t chunk_id = free_block_manager_.allocate_block(BLOCK_8K);
+            dir_entry->chunk_chain = new ChunkNode(chunk_id, BLOCK_8K);
+            tail = dir_entry->chunk_chain;
+        }
+        
+        // Check if there's space in the tail node
+        if (tail->remaining_offset < RECORD_SIZE) {
+            // Need to allocate a new block
+            BlockType new_type = tail->block_type;
+            
+            // If the current block is full, consider upgrading to a larger block type
+            if (tail->remaining_offset == 0) {
+                if (new_type < BLOCK_64K) {
+                    new_type = static_cast<BlockType>(static_cast<int>(new_type) + 1);
+                }
+            }
+            
+            uint32_t chunk_id = free_block_manager_.allocate_block(new_type);
+            tail->next = new ChunkNode(chunk_id, new_type);
+            tail = tail->next;
+        }
+        
+        // Calculate the slot based on remaining offset
+        uint32_t slot = (RECORDS_PER_BLOCK[tail->block_type] * RECORD_SIZE - tail->remaining_offset) / RECORD_SIZE;
+        
+        // Create the file metadata
+        FileMetadata metadata(filename, inode);
+        
+        // Write to the block
+        if (!write_record(tail->block_type, tail->chunk_id, slot, metadata)) {
+            return false;
+        }
+        
+        // Update the remaining offset
+        tail->remaining_offset -= RECORD_SIZE;
+        
+        // Add to the second-level hash table
+        FileLocation loc(tail->block_type, tail->chunk_id, slot);
+        (*(dir_entry->file_map))[filename] = loc;
+        
+        return true;
+    }
+    
+    // Read a file from a directory
+    bool read_file(uint64_t dir_id, const std::string& filename, FileMetadata& metadata) {
+        auto dir_it = dir_map_.find(dir_id);
+        if (dir_it == dir_map_.end()) {
+            // Directory doesn't exist
+            return false;
+        }
+        
+        DirEntry* dir_entry = dir_it->second;
+        
+        // Look up the file in the second-level hash table
+        auto file_it = dir_entry->file_map->find(filename);
+        if (file_it == dir_entry->file_map->end()) {
+            // File doesn't exist
+            return false;
+        }
+        
+        FileLocation& loc = file_it->second;
+        
+        // Read from the block
+        return read_record(loc.block_type, loc.chunk_id, loc.slot, metadata);
+    }
+    
+    // Delete a file from a directory
+    bool delete_file(uint64_t dir_id, const std::string& filename) {
+        auto dir_it = dir_map_.find(dir_id);
+        if (dir_it == dir_map_.end()) {
+            // Directory doesn't exist
+            return false;
+        }
+        
+        DirEntry* dir_entry = dir_it->second;
+        
+        // Look up the file in the second-level hash table
+        auto file_it = dir_entry->file_map->find(filename);
+        if (file_it == dir_entry->file_map->end()) {
+            // File doesn't exist
+            return false;
+        }
+        
+        FileLocation del_loc = file_it->second;
+        
+        // Remove from the second-level hash table
+        dir_entry->file_map->erase(file_it);
+        
+        // Find the tail node
+        ChunkNode* tail = find_tail_node(dir_entry->chunk_chain);
+        if (!tail) {
+            return false;  // This shouldn't happen
+        }
+        
+        // If the tail node is empty, free it and adjust the chain
+        if (tail->remaining_offset >= RECORDS_PER_BLOCK[tail->block_type] * RECORD_SIZE) {
+            // Tail node is empty, free it
+            if (tail == dir_entry->chunk_chain) {
+                // Only one node in the chain, keep it
+                return true;
+            }
+            
+            // Find the node pointing to the tail
+            ChunkNode* prev = dir_entry->chunk_chain;
+            while (prev->next != tail) {
+                prev = prev->next;
+            }
+            
+            // Remove the tail from the chain
+            prev->next = nullptr;
+            
+            // Free the block
+            free_block_manager_.free_block(tail->block_type, tail->chunk_id);
+            
+            // Delete the node
+            delete tail;
+            
+            // Update the tail node for the next operation
+            tail = prev;
+        }
+        
+        // Calculate the last slot in the tail
+        uint32_t last_slot = (RECORDS_PER_BLOCK[tail->block_type] * RECORD_SIZE - tail->remaining_offset) / RECORD_SIZE - 1;
+        
+        // If the deleted location is the last slot, just adjust the remaining offset
+        if (del_loc.block_type == tail->block_type && del_loc.chunk_id == tail->chunk_id && del_loc.slot == last_slot) {
+            tail->remaining_offset += RECORD_SIZE;
+            return true;
+        }
+        
+        // Read the last record from the tail
+        FileMetadata last_metadata;
+        if (!read_record(tail->block_type, tail->chunk_id, last_slot, last_metadata)) {
+            return false;
+        }
+        
+        // Write the last record to the deleted location
+        if (!write_record(del_loc.block_type, del_loc.chunk_id, del_loc.slot, last_metadata)) {
+            return false;
+        }
+        
+        // Update the second-level hash table for the moved record
+        std::string last_filename = last_metadata.name;
+        (*(dir_entry->file_map))[last_filename] = del_loc;
+        
+        // Adjust the remaining offset of the tail node
+        tail->remaining_offset += RECORD_SIZE;
+        
+        return true;
+    }
+    
+    // Start a readdir operation
+    ReadDirCursor* start_readdir(uint64_t dir_id) {
+        auto dir_it = dir_map_.find(dir_id);
+        if (dir_it == dir_map_.end()) {
+            // Directory doesn't exist
+            return nullptr;
+        }
+        
+        DirEntry* dir_entry = dir_it->second;
+        
+        // Find the tail node for reverse scanning
+        ChunkNode* tail = find_tail_node(dir_entry->chunk_chain);
+        if (!tail) {
+            return nullptr;  // This shouldn't happen
+        }
+        
+        // Create a new cursor with the current timestamp
+        uint64_t global_ts = get_current_timestamp();
+        ReadDirCursor* cursor = new ReadDirCursor(dir_id, tail, global_ts);
+        
+        return cursor;
+    }
+    
+    // Read a batch of files from a directory
+    std::vector<std::string> readdir_next(ReadDirCursor* cursor, size_t batch_size) {
+        std::vector<std::string> result;
+        if (!cursor || !cursor->current_node) {
+            return result;
+        }
+        
+        auto dir_it = dir_map_.find(cursor->dir_id);
+        if (dir_it == dir_map_.end()) {
+            return result;
+        }
+        
+        DirEntry* dir_entry = dir_it->second;
+        
+        // Process the current node and previous nodes
+        ChunkNode* node = cursor->current_node;
+        uint32_t slot = cursor->current_slot;
+        
+        while (node && result.size() < batch_size) {
+            // Calculate the total records in this block
+            uint32_t total_slots = (RECORDS_PER_BLOCK[node->block_type] * RECORD_SIZE - node->remaining_offset) / RECORD_SIZE;
+            
+            // Reverse scan the slots
+            while (slot < total_slots && result.size() < batch_size) {
+                FileMetadata metadata;
+                if (read_record(node->block_type, node->chunk_id, slot, metadata)) {
+                    std::string filename = metadata.name;
+                    
+                    // Check if this record's timestamp is before the global_ts
+                    if (metadata.timestamp <= cursor->global_ts && 
+                        cursor->returned_files.find(filename) == cursor->returned_files.end()) {
+                        result.push_back(filename);
+                        cursor->returned_files.insert(filename);
+                    }
+                }
+                slot++;
+            }
+            
+            // Move to the previous node
+            if (slot >= total_slots) {
+                // Find the previous node
+                if (node == dir_entry->chunk_chain) {
+                    // Reached the first node, readdir is complete
+                    cursor->current_node = nullptr;
+                    break;
+                } else {
+                    ChunkNode* prev = dir_entry->chunk_chain;
+                    while (prev->next != node) {
+                        prev = prev->next;
+                    }
+                    cursor->current_node = prev;
+                    node = prev;
+                    slot = 0;
+                    cursor->current_slot = 0;
+                }
+            } else {
+                // Update the cursor position
+                cursor->current_slot = slot;
+                break;
+            }
+        }
+        
+        return result;
+    }
+    
+    // End a readdir operation
+    void end_readdir(ReadDirCursor* cursor) {
+        if (cursor) {
+            delete cursor;
+        }
+    }
+    
+    // List all directories
+    std::vector<uint64_t> list_directories() {
+        std::vector<uint64_t> result;
+        for (const auto& pair : dir_map_) {
+            result.push_back(pair.first);
+        }
+        return result;
+    }
+    
+    // Get the number of files in a directory
+    size_t count_files(uint64_t dir_id) {
+        auto dir_it = dir_map_.find(dir_id);
+        if (dir_it == dir_map_.end()) {
+            return 0;
+        }
+        
+        return dir_it->second->file_map->size();
+    }
+};
+
+// Demo application
+int main() {
+    // Create the storage engine
+    BlockchainDirectoryStorage storage("./block_pool");
+    
+    // Create some directories
+    storage.create_directory(1);
+    storage.create_directory(2);
+    
+    std::cout << "Created directories: 1, 2" << std::endl;
+    
+    // Write some files to directory 1
+    for (int i = 0; i < 100; i++) {
+        std::string filename = "file_" + std::to_string(i) + ".txt";
+        storage.write_file(1, filename, i + 1000);
+    }
+    
+    std::cout << "Added 100 files to directory 1" << std::endl;
+    
+    // Write some files to directory 2
+    for (int i = 0; i < 50; i++) {
+        std::string filename = "doc_" + std::to_string(i) + ".pdf";
+        storage.write_file(2, filename, i + 2000);
+    }
+    
+    std::cout << "Added 50 files to directory 2" << std::endl;
+    
+    // Read a file from directory 1
+    FileMetadata metadata;
+    if (storage.read_file(1, "file_42.txt", metadata)) {
+        std::cout << "Read file from directory 1: " << metadata.name 
+                  << ", inode: " << metadata.inode 
+                  << ", timestamp: " << metadata.timestamp << std::endl;
+    } else {
+        std::cout << "Failed to read file from directory 1" << std::endl;
+    }
+    
+    // Delete some files from directory 1
+    for (int i = 0; i < 30; i += 3) {
+        std::string filename = "file_" + std::to_string(i) + ".txt";
+        storage.delete_file(1, filename);
+    }
+    
+    std::cout << "Deleted some files from directory 1" << std::endl;
+    
+    // Add some more files to directory 1
+    for (int i = 100; i < 120; i++) {
+        std::string filename = "file_" + std::to_string(i) + ".txt";
+        storage.write_file(1, filename, i + 1000);
+    }
+    
+    std::cout << "Added 20 more files to directory 1" << std::endl;
+    
+    // List all files in directory 1 using readdir
+    std::cout << "Listing files in directory 1:" << std::endl;
+    ReadDirCursor* cursor = storage.start_readdir(1);
+    if (cursor) {
+        std::vector<std::string> files;
+        int batch = 0;
+        do {
+            files = storage.readdir_next(cursor, 10);  // Get 10 files at a time
+            std::cout << "Batch " << ++batch << ": ";
+            for (const auto& file : files) {
+                std::cout << file << ", ";
+            }
+            std::cout << std::endl;
+        } while (!files.empty());
+        
+        storage.end_readdir(cursor);
+    }
+    
+    // Count files in directories
+    std::cout << "Directory 1 contains " << storage.count_files(1) << " files" << std::endl;
+    std::cout << "Directory 2 contains " << storage.count_files(2) << " files" << std::endl;
+    
+    return 0;
+}
